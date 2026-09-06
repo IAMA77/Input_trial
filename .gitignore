@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+f4poc_ctrl_*
+f4poc_ctrl_sim_*
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
