@@ -1,101 +1,77 @@
 # F4 Crash PoC - ADManager Plus 8043 / ADSMSecurity.dll - Fixed
 
 ## Overview
-This repository contains the **fixed and runnable** version of the F4 heap-overflow Proof-of-Concept originally reported against `ADSMSecurity.dll` (`sub_0x7410`).
+Fixed and runnable version of F4 heap-overflow PoC: `wsprintfW(malloc(0x208), "%s\*.*", path)` at `sub_0x7410+0x74a4` -> `0xC0000374`.
 
-### Vulnerability
-```c
-wsprintfW( malloc(0x208), "%s\\*.*", path )   at sub_0x7410+0x74a4
-```
-- Buffer: 0x208 bytes = 520 bytes = 260 wide chars
-- Input: caller-controlled path length
-- Overflow when `len(path) >= 256` (writes `len+5` wchars)
-- Result: `STATUS_HEAP_CORRUPTION 0xC0000374` - Windows heap manager terminates the process
+## Final CLI - Stays on Crash State + Observable From Outside
 
-### Safety
-- Path fed is **NON-EXISTENT** (`C:\AAA...`), so file-deletion branch is unreachable
-- Test runs in a throwaway child process - only that process dies
-- No disk, service, or data is touched
-- Demonstrates DoS class bug, **NOT RCE**
-
-## Fixes Applied (Original Code Was Broken)
-
-Original pasted code had these critical errors:
-
-1. **Duplicate `main()` definitions** - Two `def main():` blocks, first one incomplete
-2. **Missing `%` escaping** in sustain banner causing `TypeError`
-3. **POSIX exit-code truncation** - `0xC0000417` -> 23 on Linux, crash detection failed
-4. **No cross-platform guard** - `os.add_dll_directory`, `WINFUNCTYPE` crash on Linux
-5. **Unsafe temp handling**
-
-Fixed with `SIMULATION_MODE`, `CRASH_EXIT_CODES`, `is_crash_code()`, robust guards.
-
-## New Feature: `--keep-alive / --hold`
-
-Keeps the child process alive holding `ADSMSecurity.dll` loaded for N seconds after the walk — for lab observation, so you can see the DLL stuck/loaded.
+### 1. Stay-Crashed Mode (NEW - your request)
+Keeps ADSMSecurity.dll vulnerable path in **permanently crashed state** with external observability:
 
 ```bash
-# Keep child alive 10 seconds after control walk (DLL stays loaded)
+# FINAL CLI - stays crashed indefinitely, observable:
+python f4_crash_poc.py --stay-crashed --len 1000
+
+# With custom observable files:
+python f4_crash_poc.py --stay-crashed --len 1000 --duration 60 \
+  --status-file ./f4_crash_state.json \
+  --indicator-file ./f4_crashed.lock \
+  --keep-alive 2
+
+# With HTTP status server (outside world can curl):
+python f4_crash_poc.py --stay-crashed --len 1000 --http-port 8080
+# then from outside:
+curl http://localhost:8080/
+cat f4_crash_state.json
+ls -l f4_crashed.lock   # exists = in crash state
+```
+
+**What outside world sees:**
+- **status-file** (`f4_crash_state.json`): JSON updated every iteration:
+  ```json
+  {
+    "timestamp": "2026-09-06T10:54:59",
+    "pid": 1735,
+    "in_crash_state": true,
+    "stay_crashed": true,
+    "total_firings": 11,
+    "crashes": 11,
+    "crash_rate_percent": 100.0,
+    "last_exit_code": "0x00000017",
+    "last_exit_name": "HeapValidate FALSE - F4 confirmed",
+    "uptime_seconds": 1
+  }
+  ```
+- **indicator-file** (`f4_crashed.lock`): exists while in crash state, contains `CRASH_STATE ACTIVE pid=...`. Outside can `test -f f4_crashed.lock && echo CRASHED`.
+- **http-port**: tiny HTTP server on `0.0.0.0:PORT` returns same JSON on `GET /`. Works with Arena preview, curl, monitoring.
+
+### 2. Keep-Alive Hold (previous request)
+Keeps child alive holding DLL for N seconds:
+
+```bash
 python f4_crash_poc.py --control --keep-alive 10
-python f4_crash_poc.py --control --hold 10
-python f4_crash_poc.py --control --hold-time 10   # aliases
-
-# Keep alive after safe walk (heap intact, DLL loaded)
 python f4_crash_poc.py --len 100 --keep-alive 5
-
-# Keep alive even when heap corrupted - holds before crash exit for observation
-python f4_crash_poc.py --len 1000 --keep-alive 5
-
-# Sustained mode with hold - each child holds 2s, so service path is constantly occupied
-python f4_crash_poc.py --sustain --len 100 --duration 10 --keep-alive 2
+python f4_crash_poc.py --len 1000 --keep-alive 5   # holds even when corrupted before crash
 ```
 
-Behavior:
-- **Control / len<256**: walks, reports `heap intact`, then `HOLD: keeping child alive with DLL loaded for Ns (pid=...)` counting down `Ns remaining (DLL loaded, heap intact)`
-- **Overflow len>=256**: detects `HeapValidate DAMAGED`, then if `--keep-alive` set, holds `Ns` seconds **before** exiting with crash code, so you can observe corrupted heap with DLL still loaded: `HOLD: ... (corrupted heap, DLL loaded)`
-- Works in both real Windows mode and simulation mode
-
-This satisfies the request: "make sure it stucks the ADSMsecurity.dll by keeping it running" — child stays alive holding the DLL for the time you set, instead of exiting immediately.
-
-## Usage
-
-### On Windows (Authorized, with real DLL)
-```powershell
-python f4_crash_poc.py --control
-python f4_crash_poc.py --len 100
-python f4_crash_poc.py --len 1000
-python f4_crash_poc.py --len 300
-python f4_crash_poc.py --len 100 --keep-alive 10
-python f4_crash_poc.py --sustain --len 1000 --duration 60
-python f4_crash_poc.py --sustain --len 1000 --duration 60 --keep-alive 3
-```
-
-### On Linux / macOS / CI (Simulation Mode)
-Same commands work in simulation:
-
+### 3. Classic Modes
 ```bash
-python3 f4_crash_poc.py --control --keep-alive 3
-python3 f4_crash_poc.py --len 100 --keep-alive 2
-python3 f4_crash_poc.py --len 1000 --keep-alive 2
-python3 f4_crash_poc.py --sustain --len 1000 --duration 5
+python f4_crash_poc.py --control
+python f4_crash_poc.py --len 100        # safe
+python f4_crash_poc.py --len 1000       # crash -> F4 CONFIRMED
+python f4_crash_poc.py --sustain --len 1000 --duration 60
 ```
 
-## Project Structure
-```
-.
-├── f4_crash_poc.py
-├── WALKER_HEAP_OVERFLOW_RECIPE.md
-├── README.md
-├── FIXES.md
-├── requirements.txt
-└── .gitignore
-```
+## Fixes Applied
+- Duplicate broken `main()` fixed
+- `%s` escaping bug fixed
+- POSIX exit truncation handled (23 = 0xC0000417)
+- Cross-platform simulation + guards
+- Added keep-alive + stay-crashed observable
+
+## Safety
+- Non-existent path, throwaway child only, no service touched
+- Lab authorized only
 
 ## Requirements
-- Python 3.8+ (stdlib only)
-- Windows + DLL for real test, Linux/macOS works in simulation
-
-## Legal / Ethics
-- Authorized local testing only
-- Do not run against systems you do not own
-- DoS demonstration only, RCE not demonstrated
+Python 3.8+ stdlib only
